@@ -5,9 +5,12 @@ DDPServer._Crossbar = function (options) {
   options = options || {};
 
   self.nextId = 1;
-  // map from listener id to object. each object has keys 'trigger',
-  // 'callback'.
-  self.listeners = {};
+  // map from collection name (string) -> listener id -> object. each object has
+  // keys 'trigger', 'callback'.
+  self.listenersByCollection = {};
+  // For listeners without a string collection name in the trigger, map from
+  // listener id -> {trigger, callback}.
+  self.listenersWithoutCollection = {};
   self.factPackage = options.factPackage || "livedata";
   self.factName = options.factName || null;
 };
@@ -26,18 +29,37 @@ _.extend(DDPServer._Crossbar.prototype, {
   listen: function (trigger, callback) {
     var self = this;
     var id = self.nextId++;
-    self.listeners[id] = {trigger: EJSON.clone(trigger), callback: callback};
+    var collection = null;  // save this in case trigger mutates
+    var record = {trigger: EJSON.clone(trigger), callback: callback};
+    if (typeof (trigger.collection) === 'string') {
+      collection = trigger.collection;
+      if (! _.has(self.listenersByCollection, collection)) {
+        self.listenersByCollection[collection] = {};
+      }
+      self.listenersByCollection[collection][id] = record;
+    } else {
+      self.listenersWithoutCollection[id] = record;
+    }
+
     if (self.factName && Package.facts) {
       Package.facts.Facts.incrementServerFact(
         self.factPackage, self.factName, 1);
     }
+
     return {
       stop: function () {
         if (self.factName && Package.facts) {
           Package.facts.Facts.incrementServerFact(
             self.factPackage, self.factName, -1);
         }
-        delete self.listeners[id];
+        if (collection === null) {
+          delete self.listenersWithoutCollection[id];
+        } else {
+          delete self.listenersByCollection[collection][id];
+          if (_.isEmpty(self.listenersByCollection[collection])) {
+            delete self.listenersByCollection[collection];
+          }
+        }
       }
     };
   },
@@ -55,18 +77,51 @@ _.extend(DDPServer._Crossbar.prototype, {
     // Listener callbacks can yield, so we need to first find all the ones that
     // match in a single iteration over self.listeners (which can't be mutated
     // during this iteration), and then invoke the matching callbacks, checking
-    // before each call to ensure they are still in self.listeners.
-    var matchingCallbacks = {};
-    // XXX consider refactoring to "index" on "collection"
-    _.each(self.listeners, function (l, id) {
-      if (self._matches(notification, l.trigger))
-        matchingCallbacks[id] = l.callback;
-    });
+    // before each call to ensure they haven't stopped.
 
-    _.each(matchingCallbacks, function (c, id) {
-      if (_.has(self.listeners, id))
-        c(notification);
+    var matchingCallbacks = [];
+
+    if (typeof (notification.collection) === 'string') {
+      var collection = notification.collection;
+      _.each(self.listenersByCollection[collection], function (l, id) {
+        if (self._matches(notification, l.trigger)) {
+          matchingCallbacks.push({id: id, collection: collection});
+        }
+      });
+    } else {
+      // Either no collection is specified, or a non-string collection. (In
+      // practice this never happens.)  Check everything.
+      _.each(self.listenersByCollection, function (byColl, collection) {
+        _.each(byColl, function (l, id) {
+          if (self._matches(notification, l.trigger)) {
+            matchingCallbacks.push({id: id, collection: collection});
+          }
+        });
+      });
+      _.each(self.listenersWithoutCollection, function (l, id) {
+        if (self._matches(notification, l.trigger)) {
+          matchingCallbacks.push({id: id, collection: null});
+        }
+      });
+    }
+
+    _.each(matchingCallbacks, function (record) {
+      self._fireCallback(notification, record.id, record.collection);
     });
+  },
+
+  _fireCallback: function (notification, id, collection) {
+    var self = this;
+    if (collection === null) {
+      if (_.has(self.listenersWithoutCollection, id)) {
+        self.listenersWithoutCollection[id].callback(notification);
+      }
+    } else {
+      if (_.has(self.listenersByCollection, collection) &&
+          _.has(self.listenersByCollection[collection], id)) {
+        self.listenersByCollection[collection][id].callback(notification);
+      }
+    }
   },
 
   // A notification matches a trigger if all keys that exist in both are equal.
